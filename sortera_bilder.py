@@ -3,8 +3,8 @@
 sortera_bilder.py
 ==================
 
-Sorterar bilder från den senaste veckan (eller valfritt antal dagar) baserat
-på fyra centrala kategorier:
+Sorterar bilder från den senaste veckan (eller valfritt antal dagar) i en
+LOKAL mapp, baserat på fyra centrala kategorier:
 
   1. Byggarbetare   - det syns en byggarbetare (person i arbete) på bilden
   2. Tak             - bilden visar bara ett tak, inga personer av intresse
@@ -18,6 +18,9 @@ i hakparentes främst i filnamnet, t.ex.:
 
 Bilderna flyttas INTE - de ligger kvar i samma mapp, bara namnet ändras.
 
+Ligger dina bilder i Google Drive istället för lokalt? Använd
+sortera_bilder_drive.py.
+
 Användning
 ----------
     export ANTHROPIC_API_KEY="din-api-nyckel"
@@ -29,173 +32,23 @@ Se --help för fler flaggor (antal dagar, dry-run, rekursiv sökning, m.m.)
 from __future__ import annotations
 
 import argparse
-import base64
 import csv
-import io
-import json
-import mimetypes
 import os
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
-try:
-    from PIL import Image
-except ImportError:
-    print("Paketet 'Pillow' saknas. Installera med: pip install Pillow", file=sys.stderr)
-    sys.exit(1)
+import anthropic
 
-try:
-    import pillow_heif
-    pillow_heif.register_heif_opener()
-    HEIC_SUPPORT = True
-except ImportError:
-    HEIC_SUPPORT = False
-
-try:
-    import anthropic
-except ImportError:
-    print(
-        "Paketet 'anthropic' saknas. Installera med: pip install anthropic",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# Kategorier
-# ---------------------------------------------------------------------------
-
-CATEGORIES = {
-    "Byggarbetare": "Det syns tydligt en byggarbetare (en person som arbetar, t.ex. i "
-    "arbetskläder/hjälm, på ett tak eller en byggarbetsplats) på bilden.",
-    "Tak": "Bilden visar huvudsakligen bara ett tak (takyta, tegel, plåt, skorsten "
-    "etc.) utan personer och utan annat anmärkningsvärt i fokus.",
-    "Takrelaterat": "Bilden är takrelaterad men varken bara ett tak eller en "
-    "byggarbetare, t.ex. en industrilokal/industribyggnad, ett företags logga, "
-    "ett fordon eller material märkt med företagsnamn.",
-    "Ovrigt": "Inget av ovanstående stämmer, eller det går inte att avgöra vad "
-    "bilden föreställer.",
-}
-
-VALID_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif",
-}
-
-DEFAULT_MODEL = "claude-sonnet-5"
-MAX_DIMENSION = 1568  # rekommenderad maxstorlek för Claude vision
-
-
-@dataclass
-class Result:
-    path: Path
-    category: Optional[str]
-    reasoning: str
-    error: Optional[str] = None
-
-
-def build_prompt() -> str:
-    lines = [
-        "Du klassificerar ett foto i EXAKT en av följande kategorier:",
-        "",
-    ]
-    for name, desc in CATEGORIES.items():
-        lines.append(f'- "{name}": {desc}')
-    lines.append("")
-    lines.append(
-        "Svara ENDAST med kompakt JSON på formen "
-        '{"kategori": "<en av namnen ovan>", "motivering": "<max 15 ord på svenska>"}. '
-        "Inget annat i svaret."
-    )
-    return "\n".join(lines)
-
-
-def load_image_as_jpeg_b64(path: Path) -> tuple[str, str]:
-    """Läser in en bild, skalar ner den vid behov och returnerar (base64, media_type)."""
-    ext = path.suffix.lower()
-
-    if ext in {".heic", ".heif"} and not HEIC_SUPPORT:
-        raise RuntimeError(
-            "HEIC-stöd saknas. Installera med: pip install pillow-heif"
-        )
-
-    with Image.open(path) as img:
-        img = img.convert("RGB")
-        if max(img.size) > MAX_DIMENSION:
-            img.thumbnail((MAX_DIMENSION, MAX_DIMENSION))
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=88)
-        data = buf.getvalue()
-
-    return base64.standard_b64encode(data).decode("utf-8"), "image/jpeg"
-
-
-def classify_image(client: "anthropic.Anthropic", model: str, path: Path, prompt: str) -> Result:
-    try:
-        b64, media_type = load_image_as_jpeg_b64(path)
-    except Exception as exc:  # noqa: BLE001
-        return Result(path=path, category=None, reasoning="", error=f"Kunde inte läsa bild: {exc}")
-
-    try:
-        message = client.messages.create(
-            model=model,
-            max_tokens=200,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": b64,
-                            },
-                        },
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ],
-        )
-    except Exception as exc:  # noqa: BLE001
-        return Result(path=path, category=None, reasoning="", error=f"API-fel: {exc}")
-
-    text = "".join(block.text for block in message.content if hasattr(block, "text")).strip()
-
-    # Plocka ut JSON även om modellen skulle råka lägga till text runt omkring.
-    try:
-        start = text.index("{")
-        end = text.rindex("}") + 1
-        parsed = json.loads(text[start:end])
-        category = parsed.get("kategori", "").strip()
-        reasoning = parsed.get("motivering", "").strip()
-    except Exception:  # noqa: BLE001
-        return Result(path=path, category=None, reasoning="", error=f"Kunde inte tolka svar: {text!r}")
-
-    if category not in CATEGORIES:
-        # Försök hitta närmaste giltiga kategori (case-insensitive)
-        match = next((c for c in CATEGORIES if c.lower() == category.lower()), None)
-        if match is None:
-            return Result(path=path, category=None, reasoning=reasoning,
-                           error=f"Okänd kategori i svar: {category!r}")
-        category = match
-
-    return Result(path=path, category=category, reasoning=reasoning)
-
-
-def existing_tag(filename: str) -> Optional[str]:
-    """Returnerar kategorin om filnamnet redan börjar med en känd tagg."""
-    if filename.startswith("["):
-        end = filename.find("]")
-        if end != -1:
-            tag = filename[1:end]
-            if tag in CATEGORIES:
-                return tag
-    return None
+from bildklassificering import (
+    CATEGORIES,
+    DEFAULT_MODEL,
+    VALID_EXTENSIONS,
+    build_prompt,
+    classify_bytes,
+    new_tagged_name,
+)
 
 
 def file_mtime_within(path: Path, cutoff: datetime) -> bool:
@@ -218,17 +71,10 @@ def collect_images(folder: Path, recursive: bool, days: int, include_all_dates: 
 
 
 def rename_with_tag(path: Path, category: str, dry_run: bool) -> Path:
-    current_tag = existing_tag(path.name)
-    if current_tag == category:
+    new_name = new_tagged_name(path.name, category)
+    if new_name is None:
         return path  # redan rätt taggad
 
-    if current_tag is not None:
-        # Ta bort gammal tagg innan ny läggs på (t.ex. vid omklassificering).
-        base_name = path.name[path.name.find("]") + 1:].lstrip()
-    else:
-        base_name = path.name
-
-    new_name = f"[{category}] {base_name}"
     new_path = path.with_name(new_name)
 
     if dry_run:
@@ -292,10 +138,10 @@ def main() -> None:
     print(f"Hittade {len(images)} bild(er) att analysera "
           f"({'alla datum' if args.all_dates else f'senaste {args.days} dagarna'}).")
 
-    results: list[Result] = []
+    results = []
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = {
-            pool.submit(classify_image, client, args.model, path, prompt): path
+            pool.submit(classify_bytes, client, args.model, path.name, path.read_bytes(), prompt): path
             for path in images
         }
         for i, future in enumerate(as_completed(futures), start=1):
@@ -317,10 +163,9 @@ def main() -> None:
             writer = csv.writer(f)
             writer.writerow(["fil", "kategori", "motivering", "fel"])
             for r in results:
-                writer.writerow([str(r.path), r.category or "", r.reasoning, r.error or ""])
+                writer.writerow([r.name, r.category or "", r.reasoning, r.error or ""])
         print(f"\nCSV-rapport skriven till: {args.csv}")
 
-    # Sammanfattning
     counts: dict[str, int] = {}
     for r in results:
         key = r.category or "FEL"

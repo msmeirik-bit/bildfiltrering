@@ -25,6 +25,9 @@ Filerna flyttas inte och innehållet ändras inte – bara filnamnet får en
 kategori-tagg, så du enkelt kan sortera/filtrera på namn i din filhanterare
 eller fotoapp.
 
+Bilder i Google Drive istället? Hoppa till avsnittet
+[Alternativ: bilder i Google Drive](#alternativ-bilder-i-google-drive).
+
 ## Installation
 
 Kör detta på datorn där bilderna faktiskt ligger (skriptet körs inte i den
@@ -77,6 +80,51 @@ python3 sortera_bilder.py \
   --recursive \
   --csv rapport.csv
 ```
+
+## Alternativ: bilder i Google Drive
+
+Ligger bilderna i Google Drive istället för lokalt på datorn? Använd
+`sortera_bilder_drive.py` istället för `sortera_bilder.py`. Samma
+kategorier och samma princip (filerna döps om i Drive, flyttas eller
+ändras inte i övrigt) – men bilderna hämtas och döps om direkt i Drive via
+Google Drive-API:et.
+
+### Engångsinställning i Google Cloud
+
+1. Gå till https://console.cloud.google.com/ och skapa ett projekt.
+2. Sök upp **Google Drive API** under *APIs & Services → Library* och klicka **Enable**.
+3. Gå till *APIs & Services → OAuth consent screen*, välj **External**,
+   fyll i minimal info och lägg till ditt eget Google-konto under
+   **Test users** (då slipper du Googles appgranskning).
+4. Gå till *APIs & Services → Credentials → Create Credentials → OAuth
+   client ID*, välj **Desktop app**.
+5. Ladda ner JSON-filen och spara den som `credentials.json` i samma mapp
+   som skripten.
+
+### Hitta mapp-ID
+
+Öppna Drive-mappen med dina bilder i webbläsaren och kopiera antingen hela
+länken eller bara ID:t ur adressen:
+
+```
+https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQrStUvWxYz
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^ det här
+```
+
+### Installation och körning
+
+```bash
+pip install -r requirements.txt
+export ANTHROPIC_API_KEY="din-nyckel-här"
+
+python3 sortera_bilder_drive.py --folder-id "https://drive.google.com/drive/folders/1AbCd..." --dry-run
+python3 sortera_bilder_drive.py --folder-id "https://drive.google.com/drive/folders/1AbCd..."
+```
+
+Första gången öppnas en webbläsarflik där du loggar in med Google-kontot
+som äger/har åtkomst till mappen och godkänner åtkomst. En token cachas i
+`token.json` så du slipper logga in varje gång. Stödjer samma flaggor som
+`sortera_bilder.py` (`--days`, `--recursive`, `--dry-run`, `--csv`, m.fl.).
 
 ## Stödda filformat
 
